@@ -1,0 +1,12 @@
+{
+  "name": "Pet Shop Invoice Assistant (Demo)",
+  "short_name": "Invoice Demo",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F6F4EF",
+  "theme_color": "#276A4E",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
