@@ -265,13 +265,16 @@ function renderLogin() {
 
 function renderStoreConfirm() {
   const p = state.persona;
-  const options = p.role === 'owner' ? STORES.map(s => s.id) : p.stores;
+  // Everyone can pick any store (staff can cover shifts elsewhere) — their
+  // own assigned store(s) are just listed first and marked as suggested.
+  const others = STORES.map(s => s.id).filter(id => !p.stores.includes(id));
+  const options = [...p.stores, ...others];
   if (!state.storeSelection || !options.includes(state.storeSelection)) state.storeSelection = options[0];
   return `
     <div class="auth">
       <div class="auth__brand auth__brand--tight">
         <h1>Confirm your store</h1>
-        <p class="muted">Required at the start of every session — some staff work at different locations during the week, so the app never assumes a default.</p>
+        <p class="muted">Required at the start of every session — pick whichever location you're working from today, not just your usual store.</p>
       </div>
       <div class="card">
         <div class="store-list">
