@@ -97,22 +97,55 @@ file for a project shaped like this one.
    repo. Framework preset: **Other**. Leave the build command empty and
    the output directory as the project root — there's no build step.
 3. Before the first deploy (or after, under **Settings → Environment
-   Variables**), add **`ANTHROPIC_API_KEY`** with a real key from
-   [console.anthropic.com](https://console.anthropic.com). Apply it to
-   Production (and Preview, if you want preview deploys to work too).
+   Variables**), add:
+   - **`ANTHROPIC_API_KEY`** — a real key from
+     [console.anthropic.com](https://console.anthropic.com).
+   - **`ACCESS_PIN`** — any PIN/password you choose. This gates the whole
+     site (see "Access protection" below) — required for the app to load
+     at all once deployed.
+   Apply both to Production (and Preview, if you want preview deploys to
+   work too).
 4. Deploy. Vercel gives you a public `https://<project>.vercel.app` URL —
-   the static site and `/api/recognize` both live there, same origin, no
-   CORS config needed.
-5. Optional: this endpoint is public and unauthenticated once deployed —
-   anyone who has the URL can trigger a real (cheap, but non-zero) API
-   call. `api/recognize.js` caps requests at 6 images as a basic abuse
-   guard, but for a link you're sharing beyond a trusted demo audience,
-   turn on Vercel's **Deployment Protection** (a password, no code
-   required) under project settings.
+   the static site and `/api/*` all live there, same origin, no CORS
+   config needed. Visiting it prompts for the PIN before anything else
+   loads.
 
 Netlify Functions, Cloudflare Workers, or a small Express server all work
-too with minor adaptation — `api/recognize.js` is a plain
-`(req, res) => {...}` handler with no Vercel-specific imports.
+too with minor adaptation — `api/recognize.js` and `api/login.js` are
+plain `(req, res) => {...}` handlers with no Vercel-specific imports.
+`middleware.js` (the PIN gate) uses the Vercel Edge Middleware convention
+specifically — porting it elsewhere means re-implementing the same
+cookie-check as that platform's equivalent (e.g. Cloudflare Workers, or
+Netlify Edge Functions).
+
+## Access protection
+
+Because `/api/recognize` spends real money per call, the whole app sits
+behind a single shared PIN — not a real login system, just enough to stop
+someone who stumbles on the URL from running (and paying for) recognition
+calls. `middleware.js` runs in front of every request (static files and
+`/api/*` alike): without a valid session cookie, it returns a small PIN
+form instead of the real page, or a 401 for API/fetch requests. Submitting
+the correct PIN (checked against the `ACCESS_PIN` env var with a
+constant-time comparison) sets an HttpOnly, Secure cookie signed with
+HMAC-SHA256, good for 30 days.
+
+This is deliberately minimal, per the brief: one shared secret, no
+accounts, no database, easy to reason about. It stops casual/opportunistic
+use of a discovered link; it does not resist a determined attacker (there's
+no rate-limiting on PIN attempts, for instance), and everyone who has the
+PIN shares one session type with no way to tell users apart. Don't reuse
+`ACCESS_PIN` anywhere sensitive.
+
+Optional: set `SESSION_SECRET` to a separate random string (env var) if
+you want to rotate the PIN without invalidating existing sessions, or vice
+versa — without it, the signing secret is derived from `ACCESS_PIN`
+itself, which is simpler but means changing one changes the other.
+
+This gate only runs on Vercel (or another platform that executes
+`middleware.js`) — running the files locally via a plain static server
+(`python3 -m http.server`, see "Running it" above) skips it entirely, same
+as before.
 
 ## What's real vs. simulated
 
@@ -151,9 +184,9 @@ too with minor adaptation — `api/recognize.js` is a plain
 1. Tune the extraction prompt/schema (`js/invoice-tool.js`) against
    Alexandros's real supplier invoices (TZ §8) rather than the generic one
    used here.
-2. Add basic auth/rate-limiting in front of `/api/recognize` before
-   sharing the deployed URL widely — right now it's an open door to
-   whoever's paying for the API key (see "Deploying the backend").
+2. Harden access protection beyond the single shared PIN (see "Access
+   protection") — per-user accounts, rate-limiting PIN attempts, and
+   distinguishing who's using the shared session.
 3. Replace `localStorage` with the existing DB via the API/endpoint
    Alexandros provides (TZ §8).
 4. Real auth (weekly codes) and a real geolocation/Wi-Fi store suggestion.
