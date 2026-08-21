@@ -53,44 +53,66 @@ Demo data resets automatically if you clear site storage; there's no
 ## Live recognition (real Claude API calls)
 
 On the capture screen there's a second mode next to "Sample invoice":
-**🔴 Live Claude recognition**. Switch to it, paste your own Anthropic API
-key, pick a model, and add real photos of an actual invoice (or any
-document) — the app sends them straight to `api.anthropic.com` and asks
-Claude to extract the header and line items with a forced tool call
-(`record_invoice`), then runs the result through the exact same
+**🔴 Live Claude recognition**. Switch to it, pick a model, and add real
+photos of an actual invoice (or any document) — the app sends them to
+Claude and asks it to extract the header and line items with a forced tool
+call (`record_invoice`), then runs the result through the exact same
 clarification/mismatch/new-product pipeline as the scripted samples. This
 is genuinely calling the model, not another canned response.
+
+**Nobody has to paste an API key.** The app calls its own backend at
+`POST /api/recognize` (`api/recognize.js`), a small serverless function
+that holds `ANTHROPIC_API_KEY` as a server-side environment variable and
+forwards the request — the key never reaches the browser. See "Deploying
+the backend" below to stand this up; once it's deployed, live recognition
+just works for anyone who opens the site.
+
+If no backend answers (these files served as plain static files with no
+`/api` route, or opened as a claude.ai Artifact preview), the app falls
+back to offering a "paste your own key and call Claude directly from this
+browser" option — the same client-side-key pattern from the previous
+version of this demo, kept only as a fallback for local/static hosting. It
+says so plainly in-app when that path is used, since it's a demo-only
+pattern a real product must never ship.
 
 **Try it with something messy** — a photo with a bit of handwriting, an
 unfamiliar barcode, a smudge — to see Claude flag it as low-confidence
 (🔴 badge) or offer to create a new product from a barcode it's never seen,
-exactly like the scripted AquaWorld sample does with fabricated data.
+exactly like the scripted AquaWorld sample does with fabricated data. Real
+invoices won't match the demo's fake barcode database, so almost every
+line comes back as a new product — that's expected, and arguably the most
+convincing part to show a client live.
 
-A few things worth knowing:
+Cost is small — a few cents per invoice at most; see the model picker for
+a rough per-invoice estimate for each option.
 
-- **The key never leaves your browser** except in the direct request to
-  Anthropic — it's held in memory for the current draft only, never
-  written to `localStorage`, and dropped on refresh. This is still a
-  **demo-only pattern**: shipping an API key into client-side JavaScript is
-  something a real product must never do (see the in-app warning). A
-  production build needs a small backend to hold the key and proxy the
-  request — see "Next steps" below.
-- Calls go directly from the browser to the Anthropic API using the
-  documented `anthropic-dangerous-direct-browser-access` header (the same
-  mechanism the official SDK's `dangerouslyAllowBrowser` option uses) —
-  this only works when the page is served over `http(s)://`, not opened as
-  a bare `file://` path.
-- **This will not work from the published claude.ai Artifact preview** —
-  its sandbox blocks outbound network calls to anything but Google Fonts.
-  Clone this repo and run it locally (or host it yourself) to actually
-  exercise live recognition; the Artifact link is only good for the
-  scripted "Sample invoice" mode.
-- Real invoices won't match the demo's fake barcode database, so almost
-  every line comes back as a new product — that's expected, and it's
-  arguably the most convincing part to show a client live: it genuinely
-  reads a barcode it's never seen and offers to create it on the spot.
-- Cost is small — a few cents per invoice at most; see the model picker for
-  a rough per-invoice estimate for each option.
+## Deploying the backend
+
+Any host that runs a Node serverless function next to static files works;
+these steps are for [Vercel](https://vercel.com), which needs no config
+file for a project shaped like this one.
+
+1. Push this repo to GitHub (already done if you're reading this there).
+2. On [vercel.com](https://vercel.com), **Add New → Project**, import the
+   repo. Framework preset: **Other**. Leave the build command empty and
+   the output directory as the project root — there's no build step.
+3. Before the first deploy (or after, under **Settings → Environment
+   Variables**), add **`ANTHROPIC_API_KEY`** with a real key from
+   [console.anthropic.com](https://console.anthropic.com). Apply it to
+   Production (and Preview, if you want preview deploys to work too).
+4. Deploy. Vercel gives you a public `https://<project>.vercel.app` URL —
+   the static site and `/api/recognize` both live there, same origin, no
+   CORS config needed.
+5. Optional: this endpoint is public and unauthenticated once deployed —
+   anyone who has the URL can trigger a real (cheap, but non-zero) API
+   call. `api/recognize.js` caps requests at 6 images as a basic abuse
+   guard, but for a link you're sharing beyond a trusted demo audience,
+   turn on Vercel's **Deployment Protection** (a password, no code
+   required) under project settings.
+
+Netlify Functions, Cloudflare Workers, or a small Express server all work
+too with minor adaptation — `api/recognize.js` is a plain
+`(req, res) => {...}` handler with no Vercel-specific imports.
 
 ## What's real vs. simulated
 
@@ -98,7 +120,8 @@ A few things worth knowing:
 |---|---|---|
 | Photo capture / upload | Real — uses the actual camera/file picker | same |
 | Invoice recognition (**Sample invoice** mode) | **Scripted** — you pick a sample supplier, the app reveals canned OCR output | — |
-| Invoice recognition (**Live Claude recognition** mode) | **Real** — genuine Claude API call with vision + forced tool use, using your own key | same call, made server-side with a held-server key |
+| Invoice recognition (**Live Claude recognition** mode, backend deployed) | **Real** — genuine Claude API call with vision + forced tool use, key held server-side | same architecture |
+| Invoice recognition (**Live Claude recognition** mode, no backend) | **Real**, but via a visitor-pasted key called directly from the browser — fallback only | — |
 | Blurry-photo detection | **Scripted** — a manual "simulate" toggle, no real image analysis (sample mode only) | real image-quality check before OCR |
 | Totals cross-check, missing-page detection | Real logic, run against either the scripted or live-extracted data | same logic |
 | Clarification queue, pack-multiplier checks, new-product flow, batch flow | Real, interactive | same |
@@ -125,11 +148,12 @@ A few things worth knowing:
 
 ## Next steps toward the real thing
 
-1. Move the "Live recognition" call behind a small backend (even a single
-   serverless function) that holds the API key server-side and proxies the
-   request — the client-side key entry in this demo must not ship as-is.
-2. Tune the extraction prompt/schema against Alexandros's real supplier
-   invoices (TZ §8) rather than the generic one used here.
+1. Tune the extraction prompt/schema (`js/invoice-tool.js`) against
+   Alexandros's real supplier invoices (TZ §8) rather than the generic one
+   used here.
+2. Add basic auth/rate-limiting in front of `/api/recognize` before
+   sharing the deployed URL widely — right now it's an open door to
+   whoever's paying for the API key (see "Deploying the backend").
 3. Replace `localStorage` with the existing DB via the API/endpoint
    Alexandros provides (TZ §8).
 4. Real auth (weekly codes) and a real geolocation/Wi-Fi store suggestion.

@@ -130,64 +130,19 @@ function buildDraftFromScenario(key) {
 // LIVE RECOGNITION — real Claude API calls (Vision + tool use).
 //
 // Everything else in this app runs on the scripted SCENARIOS. This section
-// is the one part that talks to the real Claude API: it sends the photos
-// you actually add on the capture screen, asks Claude to extract the
-// invoice into the same shape the scripted demo uses, and feeds the result
-// through the exact same review/clarification/save pipeline. See the
-// README ("Live recognition") for the security caveats — pasting an API
-// key into a client-side page like this is a demo convenience, never a
-// production pattern.
+// is the one part that talks to the real Claude API. It tries the bundled
+// backend first (api/recognize.js — holds ANTHROPIC_API_KEY server-side,
+// see README "Deploying the backend"), so a properly-deployed instance
+// needs no key from the visitor at all. If no backend answers at
+// /api/recognize (e.g. these files are just served as plain static files,
+// or opened as a claude.ai Artifact), it falls back to asking for a
+// personal API key and calling Claude directly from the browser — a
+// demo-only pattern, see the in-app warning when that path is used.
+//
+// LIVE_MODELS / INVOICE_TOOL / LIVE_SYSTEM_PROMPT come from
+// js/invoice-tool.js, shared with api/recognize.js so the client and
+// server never drift out of sync on the extraction schema.
 // ============================================================
-
-const LIVE_MODELS = [
-  { id: 'claude-opus-5', label: 'Claude Opus 5', hint: 'best accuracy · ~$0.05/invoice' },
-  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5', hint: 'balanced · ~$0.02/invoice' },
-  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', hint: 'fastest & cheapest · ~$0.01/invoice' },
-];
-
-const INVOICE_TOOL = {
-  name: 'record_invoice',
-  description: 'Record the structured data extracted from a photographed supplier invoice.',
-  strict: true,
-  input_schema: {
-    type: 'object',
-    additionalProperties: false,
-    required: ['supplier', 'invoiceNo', 'orderNo', 'invoiceDate', 'dueDate', 'subtotal', 'vat', 'total', 'qtyPrinted', 'pagesExpected', 'items'],
-    properties: {
-      supplier: { type: 'string', description: 'Supplier / vendor name as printed.' },
-      invoiceNo: { type: 'string', description: 'Invoice number. Always present on a real invoice.' },
-      orderNo: { type: 'string', description: 'Purchase order number, or "—" if none printed.' },
-      invoiceDate: { type: 'string', description: 'Invoice date as printed (use YYYY-MM-DD if you can tell the format, otherwise copy as printed).' },
-      dueDate: { type: 'string', description: 'Payment due date as printed, or "" if none.' },
-      subtotal: { type: 'number', description: 'Total before VAT/tax, as a plain number with no currency symbol.' },
-      vat: { type: 'number', description: 'VAT / tax amount, as a plain number.' },
-      total: { type: 'number', description: 'Grand total including VAT/tax, as a plain number.' },
-      qtyPrinted: { type: 'number', description: 'The total-quantity figure printed on the invoice, if any; 0 if none is printed.' },
-      pagesExpected: { type: 'integer', description: 'The Y in a "Page X of Y" marker, if printed anywhere. If no such marker is visible, set this to the number of photos you were given.' },
-      items: {
-        type: 'array',
-        description: 'Every line item on the invoice, across all pages given.',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          required: ['barcode', 'name', 'qty', 'unit', 'price', 'confidence', 'reason', 'packSize'],
-          properties: {
-            barcode: { type: 'string', description: 'Barcode/SKU as printed. Empty string if none is visible on this line.' },
-            name: { type: 'string', description: 'Product description as printed.' },
-            qty: { type: 'number', description: 'Quantity as printed for this line (in whatever unit the invoice prints — packs, cases, or individual units).' },
-            unit: { type: 'string', description: 'Unit the quantity is printed in, e.g. "pc", "pack", "box", "kg".' },
-            price: { type: 'number', description: 'Unit price as printed for this line, as a plain number.' },
-            confidence: { type: 'string', enum: ['high', 'low'], description: '"low" if this line was handwritten, corrected, smudged, or otherwise hard to read — even if you gave your best guess.' },
-            reason: { type: 'string', description: 'If confidence is "low", a short reason (e.g. "handwritten quantity", "barcode partly smudged"). Empty string if confidence is "high".' },
-            packSize: { type: 'number', description: 'If the line explicitly states a pack/case size (e.g. "Pack of 12", "12x85g"), the number of units per pack. 0 if no such notation appears.' },
-          },
-        },
-      },
-    },
-  },
-};
-
-const LIVE_SYSTEM_PROMPT = `You are extracting structured data from photographed pages of a single supplier invoice for a pet shop's stock system. You will be given one or more photos, in page order, followed by an instruction. Read both printed and handwritten text, including corrections written over printed values. Report money fields as plain numbers with no currency symbol. If a photo shows multiple pages are stapled or a "Page X of Y" marker, use it to fill in pagesExpected. Always call the record_invoice tool with your best-effort extraction — never refuse or ask a clarifying question, since a human will review every low-confidence field afterward.`;
 
 async function fileToBase64(file) {
   const buf = await file.arrayBuffer();
@@ -197,11 +152,42 @@ async function fileToBase64(file) {
   return btoa(binary);
 }
 
-async function callClaudeVision(apiKey, model, photos) {
-  const imageBlocks = await Promise.all(photos.map(async p => ({
-    type: 'image',
-    source: { type: 'base64', media_type: p.mediaType || 'image/jpeg', data: await fileToBase64(p.file) },
+async function encodePhotos(photos) {
+  return Promise.all(photos.map(async p => ({
+    mediaType: p.mediaType || 'image/jpeg',
+    data: await fileToBase64(p.file),
   })));
+}
+
+// Preferred path: our own backend, which holds the API key server-side.
+async function callClaudeViaBackend(model, images) {
+  let res;
+  try {
+    res = await fetch('/api/recognize', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, images }),
+    });
+  } catch (networkErr) {
+    const e = new Error('Could not reach a backend at /api/recognize on this deployment.');
+    e.backendMissing = true;
+    throw e;
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (parseErr) {
+    const e = new Error(`No backend found at /api/recognize (got a non-JSON ${res.status} response — this host looks like it's serving static files only).`);
+    e.backendMissing = true;
+    throw e;
+  }
+  if (!res.ok) throw new Error(data.error || `Backend error ${res.status}`);
+  return data.extracted;
+}
+
+// Fallback path: call Claude directly from the browser with a key the
+// visitor pastes in. Demo-only — see the in-app warning where this is offered.
+async function callClaudeDirect(apiKey, model, images) {
   const body = {
     model,
     max_tokens: 8192,
@@ -209,8 +195,8 @@ async function callClaudeVision(apiKey, model, photos) {
     messages: [{
       role: 'user',
       content: [
-        ...imageBlocks,
-        { type: 'text', text: `These are ${photos.length} photo(s) of one supplier invoice, in order. Extract it with the record_invoice tool.` },
+        ...images.map(img => ({ type: 'image', source: { type: 'base64', media_type: img.mediaType, data: img.data } })),
+        { type: 'text', text: `These are ${images.length} photo(s) of one supplier invoice, in order. Extract it with the record_invoice tool.` },
       ],
     }],
     tools: [INVOICE_TOOL],
@@ -315,10 +301,13 @@ async function runLiveRecognition() {
 
   stepEl('quality').classList.add('is-done');
   await new Promise(r => setTimeout(r, 300));
-  stepEl('header').textContent = 'Sending photos to Claude API…';
+  stepEl('header').textContent = d.useOwnKey ? 'Sending photos to Claude API…' : 'Sending photos to the server…';
 
   try {
-    const extracted = await callClaudeVision(d.liveApiKey, d.liveModel, photosWithFiles);
+    const images = await encodePhotos(photosWithFiles);
+    const extracted = d.useOwnKey
+      ? await callClaudeDirect(d.liveApiKey, d.liveModel, images)
+      : await callClaudeViaBackend(d.liveModel, images);
     stepEl('header').classList.add('is-done');
     stepEl('items').textContent = 'Parsing extracted line items…';
     await new Promise(r => setTimeout(r, 250));
@@ -330,15 +319,29 @@ async function runLiveRecognition() {
     state.draft = built;
     goto('review');
   } catch (err) {
-    msgEl().innerHTML = `
-      <div class="alert alert--warn">
-        <div>⚠️ Live recognition failed: ${esc(err.message || String(err))}</div>
-        <div class="muted small">If this page is running inside a claude.ai Artifact preview, its sandbox blocks calls to the Claude API — clone the GitHub repo and open it locally (or host it yourself) to try live recognition with your own key.</div>
-        <div class="alert__actions">
-          <button class="btn btn--primary" data-action="retry-live">Try again</button>
-          <button class="btn btn--secondary" data-action="fallback-to-sample">Use a sample invoice instead</button>
-        </div>
-      </div>`;
+    if (err.backendMissing && !d.useOwnKey) {
+      msgEl().innerHTML = `
+        <div class="alert alert--warn">
+          <div>⚠️ ${esc(err.message)}</div>
+          <div class="muted small">Either this deployment doesn't have the bundled backend set up (see README "Deploying the backend"), or you're viewing this inside a claude.ai Artifact preview, whose sandbox blocks the API call either way. You can paste your own key to call Claude directly from this browser instead — a demo-only fallback, see the warning below.</div>
+          <div class="clarify-edit">
+            <input class="field__input" id="fallbackKeyInput" type="password" placeholder="sk-ant-…" autocomplete="off" />
+            <button class="btn btn--primary" data-action="use-own-key">Use this key</button>
+          </div>
+          <div class="alert__actions">
+            <button class="btn btn--secondary" data-action="fallback-to-sample">Use a sample invoice instead</button>
+          </div>
+        </div>`;
+    } else {
+      msgEl().innerHTML = `
+        <div class="alert alert--warn">
+          <div>⚠️ Live recognition failed: ${esc(err.message || String(err))}</div>
+          <div class="alert__actions">
+            <button class="btn btn--primary" data-action="retry-live">Try again</button>
+            <button class="btn btn--secondary" data-action="fallback-to-sample">Use a sample invoice instead</button>
+          </div>
+        </div>`;
+    }
   }
 }
 
@@ -593,9 +596,7 @@ function renderCapture() {
   const scenario = d.scenarioKey;
   const photos = d.photos || [];
   const realPhotoCount = photos.filter(p => p.file).length;
-  const canStart = mode === 'sample'
-    ? (scenario && photos.length)
-    : ((d.liveApiKey || '').trim() && realPhotoCount);
+  const canStart = mode === 'sample' ? (scenario && photos.length) : realPhotoCount;
 
   return `
     <div class="stack">
@@ -623,21 +624,18 @@ function renderCapture() {
       ` : `
         <div class="card card--live">
           <div class="card__title">1. Real Claude API recognition</div>
-          <p class="muted small">The photos you add below are actually sent to Claude for extraction — nothing scripted. Needs your own Anthropic API key.</p>
-          <label class="field field--tight">
-            <span class="field__label">Anthropic API key</span>
-            <input class="field__input" type="password" placeholder="sk-ant-…" data-action="live-key" value="${esc(d.liveApiKey || '')}" autocomplete="off" />
-            <span class="field__hint">Kept in memory for this session only — never saved, never sent anywhere but api.anthropic.com. Get one at <span class="field__hint-strong">console.anthropic.com</span>.</span>
-          </label>
+          <p class="muted small">The photos you add below are actually sent to Claude for extraction — nothing scripted. This deployment's server holds the API key, so no key is needed from you.</p>
           <label class="field field--tight">
             <span class="field__label">Model</span>
             <select class="field__input" data-action="live-model">
               ${LIVE_MODELS.map(m => `<option value="${m.id}" ${d.liveModel === m.id ? 'selected' : ''}>${m.label} — ${m.hint}</option>`).join('')}
             </select>
           </label>
-          <div class="alert alert--warn live-warning">
-            ⚠️ This pastes your key into client-side JavaScript, visible to anyone with dev tools open. Fine for trying this out yourself — a real product would hold the key on a backend, never in the browser.
-          </div>
+          ${d.useOwnKey ? `
+            <div class="alert alert--warn live-warning">
+              🔑 Using your own key for this attempt (no backend was found). It's held in memory only, never saved.
+            </div>
+          ` : ''}
         </div>
       `}
 
@@ -1292,7 +1290,7 @@ function onClick(e) {
       break;
     case 'nav':
       if (btn.dataset.screen === 'new-invoice') {
-        state.draft = { scenarioKey: null, photos: [], queue: [], mode: 'sample', liveApiKey: '', liveModel: LIVE_MODELS[0].id };
+        state.draft = { scenarioKey: null, photos: [], queue: [], mode: 'sample', liveApiKey: '', liveModel: LIVE_MODELS[0].id, useOwnKey: false };
         goto('capture');
       } else {
         goto(btn.dataset.screen);
@@ -1333,6 +1331,14 @@ function onClick(e) {
     case 'retry-live':
       setTimeout(runLiveRecognition, 50);
       break;
+    case 'use-own-key': {
+      const val = document.getElementById('fallbackKeyInput').value.trim();
+      if (!val) break;
+      d.liveApiKey = val;
+      d.useOwnKey = true;
+      setTimeout(runLiveRecognition, 50);
+      break;
+    }
     case 'fallback-to-sample':
       d.mode = 'sample';
       goto('capture');
@@ -1571,13 +1577,6 @@ function openStandaloneProductForm() {
 
 // select handlers that need live value (history filter, products search)
 document.addEventListener('input', (e) => {
-  if (e.target.matches('[data-action="live-key"]')) {
-    state.draft.liveApiKey = e.target.value;
-    const canStart = state.draft.liveApiKey.trim() && state.draft.photos.some(p => p.file);
-    const startBtn = document.querySelector('[data-action="start-recognition"]');
-    if (startBtn) startBtn.toggleAttribute('disabled', !canStart);
-    return;
-  }
   if (e.target.matches('[data-action="search-products"]')) {
     state.productsQuery = e.target.value;
     const q = state.productsQuery.toLowerCase();

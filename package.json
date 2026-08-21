@@ -1,0 +1,9 @@
+{
+  "name": "pet-shop-invoice-demo",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Demo prototype for the pet shop invoice-entry app. Static frontend + one Vercel serverless function (api/recognize.js) that holds the Anthropic API key server-side.",
+  "engines": {
+    "node": ">=18"
+  }
+}

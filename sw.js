@@ -1,7 +1,7 @@
 // Minimal offline shell cache for the demo PWA.
-const CACHE = 'psi-demo-v1';
+const CACHE = 'psi-demo-v2';
 const ASSETS = [
-  './', './index.html', './css/styles.css', './js/data.js', './js/app.js',
+  './', './index.html', './css/styles.css', './js/data.js', './js/invoice-tool.js', './js/app.js',
   './manifest.webmanifest', './icons/icon.svg',
 ];
 
