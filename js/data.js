@@ -5,9 +5,9 @@
  */
 
 const STORES = [
-  { id: 'lim-centre',  name: 'Limassol – Centre' },
-  { id: 'lim-marina',  name: 'Limassol – Marina' },
-  { id: 'nic-makariou',name: 'Nicosia – Makariou' },
+  { id: 'lim-centre',  name: 'Limassol Theos shop' },
+  { id: 'lim-marina',  name: 'Limassol Mikes shop' },
+  { id: 'nic-makariou',name: 'Nicosia Nicos shop' },
   { id: 'nic-strovolos',name: 'Nicosia – Strovolos' },
   { id: 'lar-finik',   name: 'Larnaca – Finikoudes' },
   { id: 'paf-kato',    name: 'Paphos – Kato Paphos' },
