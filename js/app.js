@@ -122,7 +122,224 @@ function buildDraftFromScenario(key) {
     subform: null,
     npForm: null,
     batchForm: null,
+    isLive: false,
   };
+}
+
+// ============================================================
+// LIVE RECOGNITION — real Claude API calls (Vision + tool use).
+//
+// Everything else in this app runs on the scripted SCENARIOS. This section
+// is the one part that talks to the real Claude API: it sends the photos
+// you actually add on the capture screen, asks Claude to extract the
+// invoice into the same shape the scripted demo uses, and feeds the result
+// through the exact same review/clarification/save pipeline. See the
+// README ("Live recognition") for the security caveats — pasting an API
+// key into a client-side page like this is a demo convenience, never a
+// production pattern.
+// ============================================================
+
+const LIVE_MODELS = [
+  { id: 'claude-opus-5', label: 'Claude Opus 5', hint: 'best accuracy · ~$0.05/invoice' },
+  { id: 'claude-sonnet-5', label: 'Claude Sonnet 5', hint: 'balanced · ~$0.02/invoice' },
+  { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', hint: 'fastest & cheapest · ~$0.01/invoice' },
+];
+
+const INVOICE_TOOL = {
+  name: 'record_invoice',
+  description: 'Record the structured data extracted from a photographed supplier invoice.',
+  strict: true,
+  input_schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['supplier', 'invoiceNo', 'orderNo', 'invoiceDate', 'dueDate', 'subtotal', 'vat', 'total', 'qtyPrinted', 'pagesExpected', 'items'],
+    properties: {
+      supplier: { type: 'string', description: 'Supplier / vendor name as printed.' },
+      invoiceNo: { type: 'string', description: 'Invoice number. Always present on a real invoice.' },
+      orderNo: { type: 'string', description: 'Purchase order number, or "—" if none printed.' },
+      invoiceDate: { type: 'string', description: 'Invoice date as printed (use YYYY-MM-DD if you can tell the format, otherwise copy as printed).' },
+      dueDate: { type: 'string', description: 'Payment due date as printed, or "" if none.' },
+      subtotal: { type: 'number', description: 'Total before VAT/tax, as a plain number with no currency symbol.' },
+      vat: { type: 'number', description: 'VAT / tax amount, as a plain number.' },
+      total: { type: 'number', description: 'Grand total including VAT/tax, as a plain number.' },
+      qtyPrinted: { type: 'number', description: 'The total-quantity figure printed on the invoice, if any; 0 if none is printed.' },
+      pagesExpected: { type: 'integer', description: 'The Y in a "Page X of Y" marker, if printed anywhere. If no such marker is visible, set this to the number of photos you were given.' },
+      items: {
+        type: 'array',
+        description: 'Every line item on the invoice, across all pages given.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['barcode', 'name', 'qty', 'unit', 'price', 'confidence', 'reason', 'packSize'],
+          properties: {
+            barcode: { type: 'string', description: 'Barcode/SKU as printed. Empty string if none is visible on this line.' },
+            name: { type: 'string', description: 'Product description as printed.' },
+            qty: { type: 'number', description: 'Quantity as printed for this line (in whatever unit the invoice prints — packs, cases, or individual units).' },
+            unit: { type: 'string', description: 'Unit the quantity is printed in, e.g. "pc", "pack", "box", "kg".' },
+            price: { type: 'number', description: 'Unit price as printed for this line, as a plain number.' },
+            confidence: { type: 'string', enum: ['high', 'low'], description: '"low" if this line was handwritten, corrected, smudged, or otherwise hard to read — even if you gave your best guess.' },
+            reason: { type: 'string', description: 'If confidence is "low", a short reason (e.g. "handwritten quantity", "barcode partly smudged"). Empty string if confidence is "high".' },
+            packSize: { type: 'number', description: 'If the line explicitly states a pack/case size (e.g. "Pack of 12", "12x85g"), the number of units per pack. 0 if no such notation appears.' },
+          },
+        },
+      },
+    },
+  },
+};
+
+const LIVE_SYSTEM_PROMPT = `You are extracting structured data from photographed pages of a single supplier invoice for a pet shop's stock system. You will be given one or more photos, in page order, followed by an instruction. Read both printed and handwritten text, including corrections written over printed values. Report money fields as plain numbers with no currency symbol. If a photo shows multiple pages are stapled or a "Page X of Y" marker, use it to fill in pagesExpected. Always call the record_invoice tool with your best-effort extraction — never refuse or ask a clarifying question, since a human will review every low-confidence field afterward.`;
+
+async function fileToBase64(file) {
+  const buf = await file.arrayBuffer();
+  let binary = '';
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+async function callClaudeVision(apiKey, model, photos) {
+  const imageBlocks = await Promise.all(photos.map(async p => ({
+    type: 'image',
+    source: { type: 'base64', media_type: p.mediaType || 'image/jpeg', data: await fileToBase64(p.file) },
+  })));
+  const body = {
+    model,
+    max_tokens: 8192,
+    system: LIVE_SYSTEM_PROMPT,
+    messages: [{
+      role: 'user',
+      content: [
+        ...imageBlocks,
+        { type: 'text', text: `These are ${photos.length} photo(s) of one supplier invoice, in order. Extract it with the record_invoice tool.` },
+      ],
+    }],
+    tools: [INVOICE_TOOL],
+    tool_choice: { type: 'tool', name: 'record_invoice' },
+  };
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json()).error?.message || ''; } catch (e) { /* ignore */ }
+    throw new Error(`Claude API error ${res.status}${detail ? ': ' + detail : ''}`);
+  }
+  const data = await res.json();
+  const toolUse = (data.content || []).find(b => b.type === 'tool_use');
+  if (!toolUse) throw new Error('Claude responded without structured data — try again.');
+  return toolUse.input;
+}
+
+function buildDraftFromLiveExtraction(extracted, photos) {
+  const header = {
+    supplier: extracted.supplier || 'Unknown supplier',
+    invoiceNo: extracted.invoiceNo || '',
+    orderNo: extracted.orderNo || '—',
+    invoiceDate: extracted.invoiceDate || '',
+    dueDate: extracted.dueDate || '',
+    subtotal: +extracted.subtotal || 0,
+    vat: +extracted.vat || 0,
+    total: +extracted.total || 0,
+    qtyPrinted: +extracted.qtyPrinted || 0,
+  };
+  const items = (extracted.items || []).map(raw => {
+    const barcode = (raw.barcode || '').trim();
+    const master = barcode && state.products[barcode];
+    const qtyPrinted = +raw.qty || 0;
+    const price = +raw.price || 0;
+    return {
+      barcode: barcode || '(none printed)',
+      name: raw.name || 'Unrecognized item',
+      qtyPrinted,
+      unit: raw.unit || 'pc',
+      price,
+      lineTotal: +(qtyPrinted * price).toFixed(2),
+      confidence: raw.confidence === 'low' ? 'low' : 'high',
+      liveReason: raw.reason || '',
+      isNew: !master,
+      isBatch: false,
+      packInvoice: raw.packSize ? { size: +raw.packSize } : null,
+      handwritten: false,
+    };
+  });
+  const queue = [];
+  items.forEach((it, idx) => {
+    if (it.confidence === 'low') {
+      queue.push({ id: uid(), type: 'live_review', itemIdx: idx, resolved: false, reason: it.liveReason });
+    }
+    if (it.packInvoice && !it.isNew) {
+      const master = state.products[it.barcode];
+      const ok = master.packMultiplier === it.packInvoice.size;
+      queue.push({
+        id: uid(), type: ok ? 'pack_ok' : 'pack_warn', itemIdx: idx, resolved: false,
+        invoiceSize: it.packInvoice.size, cardSize: master.packMultiplier,
+      });
+    }
+    if (it.isNew) {
+      queue.push({ id: uid(), type: 'new_product', itemIdx: idx, resolved: false });
+    }
+  });
+  const pagesExpected = Math.max(1, +extracted.pagesExpected || photos.length);
+  return {
+    scenarioKey: null,
+    supplier: header.supplier,
+    header,
+    items,
+    queue,
+    pagesExpected,
+    pagesProvided: photos.length,
+    extraPages: [],
+    mismatchOverride: false,
+    photos: state.draft.photos,
+    editIdx: null,
+    editValue: '',
+    subform: null,
+    npForm: null,
+    batchForm: null,
+    isLive: true,
+  };
+}
+
+async function runLiveRecognition() {
+  const d = state.draft;
+  const stepEl = (name) => document.querySelector(`#recogSteps li[data-step="${name}"]`);
+  const msgEl = () => document.getElementById('recogMsg');
+  const photosWithFiles = d.photos.filter(p => p.file);
+
+  stepEl('quality').classList.add('is-done');
+  await new Promise(r => setTimeout(r, 300));
+  stepEl('header').textContent = 'Sending photos to Claude API…';
+
+  try {
+    const extracted = await callClaudeVision(d.liveApiKey, d.liveModel, photosWithFiles);
+    stepEl('header').classList.add('is-done');
+    stepEl('items').textContent = 'Parsing extracted line items…';
+    await new Promise(r => setTimeout(r, 250));
+    stepEl('items').classList.add('is-done');
+    await new Promise(r => setTimeout(r, 250));
+    stepEl('totals').classList.add('is-done');
+    await new Promise(r => setTimeout(r, 350));
+    const built = buildDraftFromLiveExtraction(extracted, photosWithFiles);
+    state.draft = built;
+    goto('review');
+  } catch (err) {
+    msgEl().innerHTML = `
+      <div class="alert alert--warn">
+        <div>⚠️ Live recognition failed: ${esc(err.message || String(err))}</div>
+        <div class="muted small">If this page is running inside a claude.ai Artifact preview, its sandbox blocks calls to the Claude API — clone the GitHub repo and open it locally (or host it yourself) to try live recognition with your own key.</div>
+        <div class="alert__actions">
+          <button class="btn btn--primary" data-action="retry-live">Try again</button>
+          <button class="btn btn--secondary" data-action="fallback-to-sample">Use a sample invoice instead</button>
+        </div>
+      </div>`;
+  }
 }
 
 // ---------- init ----------
@@ -372,25 +589,57 @@ function historyRow(h) {
 
 function renderCapture() {
   const d = state.draft;
-  const scenario = d && d.scenarioKey;
-  const photos = (d && d.photos) || [];
+  const mode = d.mode || 'sample';
+  const scenario = d.scenarioKey;
+  const photos = d.photos || [];
+  const realPhotoCount = photos.filter(p => p.file).length;
+  const canStart = mode === 'sample'
+    ? (scenario && photos.length)
+    : ((d.liveApiKey || '').trim() && realPhotoCount);
+
   return `
     <div class="stack">
       <h2 class="screen-title">New Invoice</h2>
       <p class="muted">${esc(storeName(state.currentStore))}</p>
 
-      <div class="card">
-        <div class="card__title">1. Pick a sample invoice to simulate</div>
-        <p class="muted small">This demo doesn't call a real OCR service — choose which supplier's invoice the scan should reveal.</p>
-        <div class="scenario-grid">
-          ${Object.values(SCENARIOS).map(sc => `
-            <button class="scenario-card${scenario === sc.key ? ' is-selected' : ''}" data-action="pick-scenario" data-key="${sc.key}">
-              <div class="scenario-card__name">${esc(sc.supplier)}</div>
-              <div class="scenario-card__blurb muted small">${esc(sc.blurb)}</div>
-            </button>
-          `).join('')}
-        </div>
+      <div class="mode-toggle">
+        <button class="mode-btn${mode === 'sample' ? ' is-active' : ''}" data-action="set-mode" data-mode="sample">🎬 Sample invoice</button>
+        <button class="mode-btn${mode === 'live' ? ' is-active' : ''}" data-action="set-mode" data-mode="live">🔴 Live Claude recognition</button>
       </div>
+
+      ${mode === 'sample' ? `
+        <div class="card">
+          <div class="card__title">1. Pick a sample invoice to simulate</div>
+          <p class="muted small">This mode doesn't call a real OCR service — choose which supplier's invoice the scan should reveal.</p>
+          <div class="scenario-grid">
+            ${Object.values(SCENARIOS).map(sc => `
+              <button class="scenario-card${scenario === sc.key ? ' is-selected' : ''}" data-action="pick-scenario" data-key="${sc.key}">
+                <div class="scenario-card__name">${esc(sc.supplier)}</div>
+                <div class="scenario-card__blurb muted small">${esc(sc.blurb)}</div>
+              </button>
+            `).join('')}
+          </div>
+        </div>
+      ` : `
+        <div class="card card--live">
+          <div class="card__title">1. Real Claude API recognition</div>
+          <p class="muted small">The photos you add below are actually sent to Claude for extraction — nothing scripted. Needs your own Anthropic API key.</p>
+          <label class="field field--tight">
+            <span class="field__label">Anthropic API key</span>
+            <input class="field__input" type="password" placeholder="sk-ant-…" data-action="live-key" value="${esc(d.liveApiKey || '')}" autocomplete="off" />
+            <span class="field__hint">Kept in memory for this session only — never saved, never sent anywhere but api.anthropic.com. Get one at <span class="field__hint-strong">console.anthropic.com</span>.</span>
+          </label>
+          <label class="field field--tight">
+            <span class="field__label">Model</span>
+            <select class="field__input" data-action="live-model">
+              ${LIVE_MODELS.map(m => `<option value="${m.id}" ${d.liveModel === m.id ? 'selected' : ''}>${m.label} — ${m.hint}</option>`).join('')}
+            </select>
+          </label>
+          <div class="alert alert--warn live-warning">
+            ⚠️ This pastes your key into client-side JavaScript, visible to anyone with dev tools open. Fine for trying this out yourself — a real product would hold the key on a backend, never in the browser.
+          </div>
+        </div>
+      `}
 
       <div class="card">
         <div class="card__title">2. Add photos</div>
@@ -409,11 +658,11 @@ function renderCapture() {
           </div>
         `).join('')}</div>` : '<div class="empty">No photos added yet.</div>'}
 
-        <button class="link small" data-action="sim-blurry">🧪 Simulate a blurry photo (demo)</button>
+        ${mode === 'sample' ? `<button class="link small" data-action="sim-blurry">🧪 Simulate a blurry photo (demo)</button>` : ''}
       </div>
 
-      <button class="btn btn--primary btn--block btn--lg" data-action="start-recognition" ${scenario && photos.length ? '' : 'disabled'}>
-        Start recognition
+      <button class="btn btn--primary btn--block btn--lg" data-action="start-recognition" ${canStart ? '' : 'disabled'}>
+        ${mode === 'live' ? '🔴 Send to Claude & recognize' : 'Start recognition'}
       </button>
     </div>
   `;
@@ -492,6 +741,7 @@ function renderReview() {
       ${mismatch ? `<div>Recognized items total <strong>${fmt(sum)}</strong> but the invoice header says <strong>${fmt(d.header.subtotal)}</strong>. This invoice won't be posted automatically until it's sorted out.</div>` : ''}
       <div class="alert__actions">
         ${canFixPages ? `<button class="btn btn--primary" data-action="add-missing-pages">📷 Add missing page(s)</button>` : ''}
+        ${(missingPages && d.isLive) ? `<button class="btn btn--primary" data-action="capture-more-pages">📷 Take/upload the missing page(s)</button>` : ''}
         ${(p.role !== 'employee') ? `
           <label class="checkbox">
             <input type="checkbox" data-action="toggle-override" ${d.mismatchOverride ? 'checked' : ''} />
@@ -512,11 +762,18 @@ function renderReview() {
 
       <div class="save-bar">
         <button class="btn btn--primary btn--block btn--lg" data-action="save-invoice" ${readyToSave(d) ? '' : 'disabled'}>
-          ${readyToSave(d) ? '✓ Save invoice' : `Resolve ${queueUnresolvedCount(d) || ''} item(s) to save`}
+          ${saveButtonLabel(d)}
         </button>
       </div>
     </div>
   `;
+}
+
+function saveButtonLabel(d) {
+  if (readyToSave(d)) return '✓ Save invoice';
+  const unresolved = queueUnresolvedCount(d);
+  if (unresolved > 0) return `Resolve ${unresolved} item(s) to save`;
+  return 'Sort out the totals above to save';
 }
 
 function renderHeaderCard(d) {
@@ -586,6 +843,33 @@ function renderQueueQuestion(d, q) {
             <button class="btn btn--primary" data-action="q-save-edit" data-qid="${q.id}">Save</button>
           </div>
         ` : `
+          <div class="clarify-actions">
+            <button class="btn btn--primary" data-action="q-confirm" data-qid="${q.id}">✓ Correct</button>
+            <button class="btn btn--secondary" data-action="q-edit-toggle" data-qid="${q.id}">✏️ Edit</button>
+          </div>
+        `}
+      </div>
+    `;
+  }
+
+  if (q.type === 'live_review') {
+    const it = d.items[q.itemIdx];
+    const isEditing = d.editIdx === q.id;
+    return `
+      <div class="clarify-q">
+        <div>🔴 <strong>${esc(it.name)}</strong> — Claude flagged this line as low-confidence${q.reason ? `: <em>${esc(q.reason)}</em>` : '.'}</div>
+        ${isEditing ? `
+          <div class="live-edit-grid">
+            <label class="field field--tight"><span class="field__label">Name</span><input class="field__input" id="liveEditName_${q.id}" value="${esc(it.name)}" /></label>
+            <label class="field field--tight"><span class="field__label">Barcode</span><input class="field__input" id="liveEditBarcode_${q.id}" value="${esc(it.barcode)}" /></label>
+            <label class="field field--tight"><span class="field__label">Qty</span><input class="field__input" id="liveEditQty_${q.id}" type="number" value="${it.qtyPrinted}" /></label>
+            <label class="field field--tight"><span class="field__label">Price</span><input class="field__input" id="liveEditPrice_${q.id}" type="number" step="0.01" value="${it.price}" /></label>
+          </div>
+          <div class="clarify-actions">
+            <button class="btn btn--primary" data-action="q-save-live-edit" data-qid="${q.id}">Save</button>
+          </div>
+        ` : `
+          <div class="muted small">Read as: ${esc(it.barcode)} · ${it.qtyPrinted} ${esc(it.unit)} × ${fmt(it.price)}</div>
           <div class="clarify-actions">
             <button class="btn btn--primary" data-action="q-confirm" data-qid="${q.id}">✓ Correct</button>
             <button class="btn btn--secondary" data-action="q-edit-toggle" data-qid="${q.id}">✏️ Edit</button>
@@ -954,7 +1238,7 @@ function onChange(e) {
 function handleFileInput(input) {
   const files = Array.from(input.files || []);
   files.forEach(file => {
-    state.draft.photos.push({ id: uid(), url: URL.createObjectURL(file), blurry: false, name: file.name });
+    state.draft.photos.push({ id: uid(), url: URL.createObjectURL(file), blurry: false, name: file.name, file, mediaType: file.type });
   });
   input.value = '';
   render();
@@ -1008,7 +1292,7 @@ function onClick(e) {
       break;
     case 'nav':
       if (btn.dataset.screen === 'new-invoice') {
-        state.draft = { scenarioKey: null, photos: [], queue: [] };
+        state.draft = { scenarioKey: null, photos: [], queue: [], mode: 'sample', liveApiKey: '', liveModel: LIVE_MODELS[0].id };
         goto('capture');
       } else {
         goto(btn.dataset.screen);
@@ -1037,12 +1321,27 @@ function onClick(e) {
       d.photos.push({ id: uid(), url: null, blurry: true, name: 'blurry-demo' });
       render();
       break;
+    case 'set-mode':
+      d.mode = btn.dataset.mode;
+      render();
+      break;
     case 'start-recognition':
       goto('recognizing');
-      setTimeout(runRecognitionSequence, 50);
+      if (d.mode === 'live') setTimeout(runLiveRecognition, 50);
+      else setTimeout(runRecognitionSequence, 50);
+      break;
+    case 'retry-live':
+      setTimeout(runLiveRecognition, 50);
+      break;
+    case 'fallback-to-sample':
+      d.mode = 'sample';
+      goto('capture');
       break;
     case 'retake-blurry':
       d.photos = d.photos.filter(p => !p.blurry);
+      goto('capture');
+      break;
+    case 'capture-more-pages':
       goto('capture');
       break;
 
@@ -1071,6 +1370,26 @@ function onClick(e) {
       const input = document.getElementById('editInput_' + q.id);
       const val = input.value.trim();
       applyQueueEdit(d, q, val);
+      break;
+    }
+    case 'q-save-live-edit': {
+      const q = d.queue.find(x => x.id === btn.dataset.qid);
+      const it = d.items[q.itemIdx];
+      it.name = document.getElementById('liveEditName_' + q.id).value.trim() || it.name;
+      it.barcode = document.getElementById('liveEditBarcode_' + q.id).value.trim() || it.barcode;
+      it.qtyPrinted = +document.getElementById('liveEditQty_' + q.id).value || it.qtyPrinted;
+      it.price = +document.getElementById('liveEditPrice_' + q.id).value || it.price;
+      it.lineTotal = +(it.qtyPrinted * it.price).toFixed(2);
+      it.confidence = 'high';
+      const master = state.products[it.barcode];
+      it.isNew = !master;
+      if (!it.isNew) {
+        const staleNewProductQ = d.queue.find(x => x.type === 'new_product' && x.itemIdx === q.itemIdx && !x.resolved);
+        if (staleNewProductQ) staleNewProductQ.resolved = true;
+      }
+      q.resolved = true;
+      d.editIdx = null;
+      render();
       break;
     }
     case 'q-pack-use-invoice': {
@@ -1252,6 +1571,13 @@ function openStandaloneProductForm() {
 
 // select handlers that need live value (history filter, products search)
 document.addEventListener('input', (e) => {
+  if (e.target.matches('[data-action="live-key"]')) {
+    state.draft.liveApiKey = e.target.value;
+    const canStart = state.draft.liveApiKey.trim() && state.draft.photos.some(p => p.file);
+    const startBtn = document.querySelector('[data-action="start-recognition"]');
+    if (startBtn) startBtn.toggleAttribute('disabled', !canStart);
+    return;
+  }
   if (e.target.matches('[data-action="search-products"]')) {
     state.productsQuery = e.target.value;
     const q = state.productsQuery.toLowerCase();
@@ -1270,6 +1596,10 @@ document.addEventListener('input', (e) => {
   }
 });
 document.addEventListener('change', (e) => {
+  if (e.target.matches('[data-action="live-model"]')) {
+    state.draft.liveModel = e.target.value;
+    return;
+  }
   if (e.target.matches('[data-action="filter-history"]')) {
     state.historyStoreFilter = e.target.value;
     render();

@@ -50,14 +50,57 @@ first, since staff use personal phones on the shop floor.
 Demo data resets automatically if you clear site storage; there's no
 "reset" button in the UI (add one if it's useful for a live demo).
 
+## Live recognition (real Claude API calls)
+
+On the capture screen there's a second mode next to "Sample invoice":
+**🔴 Live Claude recognition**. Switch to it, paste your own Anthropic API
+key, pick a model, and add real photos of an actual invoice (or any
+document) — the app sends them straight to `api.anthropic.com` and asks
+Claude to extract the header and line items with a forced tool call
+(`record_invoice`), then runs the result through the exact same
+clarification/mismatch/new-product pipeline as the scripted samples. This
+is genuinely calling the model, not another canned response.
+
+**Try it with something messy** — a photo with a bit of handwriting, an
+unfamiliar barcode, a smudge — to see Claude flag it as low-confidence
+(🔴 badge) or offer to create a new product from a barcode it's never seen,
+exactly like the scripted AquaWorld sample does with fabricated data.
+
+A few things worth knowing:
+
+- **The key never leaves your browser** except in the direct request to
+  Anthropic — it's held in memory for the current draft only, never
+  written to `localStorage`, and dropped on refresh. This is still a
+  **demo-only pattern**: shipping an API key into client-side JavaScript is
+  something a real product must never do (see the in-app warning). A
+  production build needs a small backend to hold the key and proxy the
+  request — see "Next steps" below.
+- Calls go directly from the browser to the Anthropic API using the
+  documented `anthropic-dangerous-direct-browser-access` header (the same
+  mechanism the official SDK's `dangerouslyAllowBrowser` option uses) —
+  this only works when the page is served over `http(s)://`, not opened as
+  a bare `file://` path.
+- **This will not work from the published claude.ai Artifact preview** —
+  its sandbox blocks outbound network calls to anything but Google Fonts.
+  Clone this repo and run it locally (or host it yourself) to actually
+  exercise live recognition; the Artifact link is only good for the
+  scripted "Sample invoice" mode.
+- Real invoices won't match the demo's fake barcode database, so almost
+  every line comes back as a new product — that's expected, and it's
+  arguably the most convincing part to show a client live: it genuinely
+  reads a barcode it's never seen and offers to create it on the spot.
+- Cost is small — a few cents per invoice at most; see the model picker for
+  a rough per-invoice estimate for each option.
+
 ## What's real vs. simulated
 
 | Area | This demo | Production (per TZ) |
 |---|---|---|
 | Photo capture / upload | Real — uses the actual camera/file picker | same |
-| Invoice recognition | **Scripted** — you pick a sample supplier, the app reveals canned OCR output | Claude API call on the captured photos |
-| Blurry-photo detection | **Scripted** — a manual "simulate" toggle, no real image analysis | real image-quality check before OCR |
-| Totals cross-check, missing-page detection | Real logic, run against the scripted data | same logic, real data |
+| Invoice recognition (**Sample invoice** mode) | **Scripted** — you pick a sample supplier, the app reveals canned OCR output | — |
+| Invoice recognition (**Live Claude recognition** mode) | **Real** — genuine Claude API call with vision + forced tool use, using your own key | same call, made server-side with a held-server key |
+| Blurry-photo detection | **Scripted** — a manual "simulate" toggle, no real image analysis (sample mode only) | real image-quality check before OCR |
+| Totals cross-check, missing-page detection | Real logic, run against either the scripted or live-extracted data | same logic |
 | Clarification queue, pack-multiplier checks, new-product flow, batch flow | Real, interactive | same |
 | Roles (employee/manager/owner) | Real gating in the UI | same, backed by real auth |
 | Weekly access code | Cosmetic field, accepts anything | real weekly code tied to store Wi-Fi code |
@@ -82,10 +125,13 @@ Demo data resets automatically if you clear site storage; there's no
 
 ## Next steps toward the real thing
 
-1. Swap the scripted recognition step for real Claude API calls on the
-   captured photos.
-2. Replace `localStorage` with the existing DB via the API/endpoint
+1. Move the "Live recognition" call behind a small backend (even a single
+   serverless function) that holds the API key server-side and proxies the
+   request — the client-side key entry in this demo must not ship as-is.
+2. Tune the extraction prompt/schema against Alexandros's real supplier
+   invoices (TZ §8) rather than the generic one used here.
+3. Replace `localStorage` with the existing DB via the API/endpoint
    Alexandros provides (TZ §8).
-3. Real auth (weekly codes) and a real geolocation/Wi-Fi store suggestion.
-4. Wire the "Add product" standalone screen (currently a stub) into the
+4. Real auth (weekly codes) and a real geolocation/Wi-Fi store suggestion.
+5. Wire the "Add product" standalone screen (currently a stub) into the
    same product-card component used inline during invoice entry.
